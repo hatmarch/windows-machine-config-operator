@@ -5,13 +5,14 @@ import (
 	"testing"
 	"time"
 
+	framework "github.com/operator-framework/operator-sdk/pkg/test"
+	"github.com/pkg/errors"
+	core "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
+
 	"github.com/openshift/windows-machine-config-operator/pkg/controller/retry"
 	"github.com/openshift/windows-machine-config-operator/test/e2e/clusterinfo"
 	"github.com/openshift/windows-machine-config-operator/test/e2e/providers"
-	framework "github.com/operator-framework/operator-sdk/pkg/test"
-	"github.com/pkg/errors"
-	"k8s.io/api/core/v1"
-	"k8s.io/client-go/kubernetes"
 )
 
 var (
@@ -37,7 +38,7 @@ type globalContext struct {
 	// numberOfNodes to be used for the test suite.
 	numberOfNodes int32
 	// nodes are the Windows nodes created by the operator
-	nodes []v1.Node
+	nodes []core.Node
 	// skipNodeDeletion allows the Windows nodes to hang around after the test suite has been run.
 	skipNodeDeletion bool
 	// sshKeyPair is the name of the keypair that we can use to decrypt the Windows node created in AWS cloud

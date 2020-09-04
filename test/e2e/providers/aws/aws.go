@@ -3,7 +3,6 @@ package aws
 import (
 	"encoding/json"
 	"fmt"
-	"k8s.io/apimachinery/pkg/util/rand"
 	"log"
 	"os"
 	"strings"
@@ -16,11 +15,13 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
 	"github.com/aws/aws-sdk-go/service/iam"
 	mapi "github.com/openshift/machine-api-operator/pkg/apis/machine/v1beta1"
-	"github.com/openshift/windows-machine-config-operator/test/e2e/clusterinfo"
-	"k8s.io/api/core/v1"
+	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/rand"
 	awsprovider "sigs.k8s.io/cluster-api-provider-aws/pkg/apis/awsprovider/v1beta1"
+
+	"github.com/openshift/windows-machine-config-operator/test/e2e/clusterinfo"
 )
 
 const (
@@ -111,7 +112,7 @@ func SetupAWSCloudProvider(region, sshKeyPair string, hasCustomVXLANPort bool) (
 // getInfraID returns the infrastructure ID associated with the OpenShift cluster. This is public for
 // testing purposes as of now.
 func (a *awsProvider) getInfraID() (string, error) {
-	infraID, err := a.openShiftClient.GetInfrastructureID()
+	infraID, err := a.openShiftClient.GetClusterID()
 	if err != nil {
 		return "", fmt.Errorf("erroring getting OpenShift infrastructure ID associated with the cluster")
 	}
@@ -355,7 +356,7 @@ func (a *awsProvider) GenerateMachineSet(withWindowsLabel bool, replicas int32) 
 		IAMInstanceProfile: &awsprovider.AWSResourceReference{
 			ID: instanceProfile.Name,
 		},
-		CredentialsSecret: &v1.LocalObjectReference{
+		CredentialsSecret: &core.LocalObjectReference{
 			Name: "aws-cloud-credentials",
 		},
 		SecurityGroups: []awsprovider.AWSResourceReference{
@@ -371,7 +372,7 @@ func (a *awsProvider) GenerateMachineSet(withWindowsLabel bool, replicas int32) 
 			a.region,
 			*subnet.AvailabilityZone,
 		},
-		UserDataSecret: &v1.LocalObjectReference{Name: "windows-user-data"},
+		UserDataSecret: &core.LocalObjectReference{Name: "windows-user-data"},
 		KeyName:        &a.sshKeyPair,
 	}
 

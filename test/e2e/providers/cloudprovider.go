@@ -3,7 +3,7 @@ package providers
 import (
 	"fmt"
 
-	"github.com/openshift/api/config/v1"
+	config "github.com/openshift/api/config/v1"
 	mapi "github.com/openshift/machine-api-operator/pkg/apis/machine/v1beta1"
 	oc "github.com/openshift/windows-machine-config-operator/test/e2e/clusterinfo"
 	awsProvider "github.com/openshift/windows-machine-config-operator/test/e2e/providers/aws"
@@ -19,14 +19,14 @@ func NewCloudProvider(sshKeyPair string, hasCustomVXLANPort bool) (CloudProvider
 	if err != nil {
 		return nil, errors.Wrap(err, "Getting OpenShift client failed")
 	}
-	cloudProvider, err := openshift.GetCloudProvider()
+	platformStatus, err := openshift.GetPlatformStatus()
 	if err != nil {
 		return nil, errors.Wrap(err, "Getting cloud provider type")
 	}
-	switch provider := cloudProvider.Type; provider {
-	case v1.AWSPlatformType:
+	switch provider := platformStatus.Type; provider {
+	case config.AWSPlatformType:
 		// 	Setup the AWS cloud provider in the same region where the cluster is running
-		return awsProvider.SetupAWSCloudProvider(cloudProvider.AWS.Region, sshKeyPair, hasCustomVXLANPort)
+		return awsProvider.SetupAWSCloudProvider(platformStatus.AWS.Region, sshKeyPair, hasCustomVXLANPort)
 	default:
 		return nil, fmt.Errorf("the '%v' cloud provider is not supported", provider)
 	}
