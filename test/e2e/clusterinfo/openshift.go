@@ -7,6 +7,7 @@ import (
 	config "github.com/openshift/api/config/v1"
 	configClient "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
 	operatorClient "github.com/openshift/client-go/operator/clientset/versioned/typed/operator/v1"
+	mapiClient "github.com/openshift/machine-api-operator/pkg/generated/clientset/versioned/typed/machine/v1beta1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrlruntimecfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
@@ -16,6 +17,7 @@ import (
 type OpenShift struct {
 	ConfigClient   configClient.ConfigV1Interface
 	OperatorClient operatorClient.OperatorV1Interface
+	MachineClient  mapiClient.MachineV1beta1Interface
 }
 
 // GetOpenShift creates a client for the current OpenShift cluster.
@@ -35,9 +37,15 @@ func GetOpenShift() (*OpenShift, error) {
 		return nil, err
 	}
 
+	mapic, err := mapiClient.NewForConfig(rc)
+	if err != nil {
+		return nil, err
+	}
+
 	return &OpenShift{
 		ConfigClient:   cc,
 		OperatorClient: oc,
+		MachineClient:  mapic,
 	}, nil
 }
 
