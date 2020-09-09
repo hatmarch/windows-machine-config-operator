@@ -32,7 +32,6 @@ func TestWMCO(t *testing.T) {
 	// https://github.com/operator-framework/operator-sdk/blob/b448429687fd7cb2343d022814ed70c9d264612b/pkg/test/main_entry.go#L51
 	gc.numberOfNodes = int32(numberOfNodes)
 	gc.skipNodeDeletion = skipNodeDeletion
-	gc.sshKeyPair = sshKeyPair
 	// When the OPENSHIFT_CI env var is set to true, the test is running within CI
 	if inCI := os.Getenv("OPENSHIFT_CI"); inCI == "true" {
 		// In the CI container the WMCO binary will be found here

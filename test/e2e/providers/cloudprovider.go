@@ -32,7 +32,7 @@ func NewCloudProvider(sshKeyPair string, hasCustomVXLANPort bool) (CloudProvider
 		// 	Setup the AWS cloud provider in the same region where the cluster is running
 		return awsProvider.SetupAWSCloudProvider(platformStatus.AWS.Region, sshKeyPair, hasCustomVXLANPort)
 	case config.AzurePlatformType:
-		return azureProvider.New(openshift, sshKeyPair, hasCustomVXLANPort)
+		return azureProvider.New(openshift, hasCustomVXLANPort)
 	default:
 		return nil, fmt.Errorf("the '%v' platform type is not supported", platformStatus.Type)
 	}

@@ -31,12 +31,10 @@ const (
 type Provider struct {
 	oc     *clusterinfo.OpenShift
 	vmSize string
-	// sshKeyPair is the key pair associated with the Windows VM
-	sshKeyPair string
 }
 
 // New returns a new Azure provider struct with the give client set and ssh key pair
-func New(oc *clusterinfo.OpenShift, sshKeyPair string, hasCustomVXLANPort bool) (*Provider, error) {
+func New(oc *clusterinfo.OpenShift, hasCustomVXLANPort bool) (*Provider, error) {
 	if hasCustomVXLANPort == true {
 		return nil, fmt.Errorf("custom VXLAN port is not supported on current Azure image")
 	}
@@ -44,11 +42,10 @@ func New(oc *clusterinfo.OpenShift, sshKeyPair string, hasCustomVXLANPort bool) 
 	return &Provider{
 		oc,
 		defaultVMSize,
-		sshKeyPair,
 	}, nil
 }
 
-func newAzureMachineProviderSpec(clusterID string, status *config.PlatformStatus, location, zone, vmSize, sshKeyPair string) (*azureprovider.AzureMachineProviderSpec, error) {
+func newAzureMachineProviderSpec(clusterID string, status *config.PlatformStatus, location, zone, vmSize string) (*azureprovider.AzureMachineProviderSpec, error) {
 	if clusterID == "" {
 		return nil, fmt.Errorf("clusterID is empty")
 	}
@@ -88,7 +85,6 @@ func newAzureMachineProviderSpec(clusterID string, status *config.PlatformStatus
 				StorageAccountType: defaultStorageAccountType,
 			},
 		},
-		SSHPublicKey:         sshKeyPair,
 		PublicIP:             false,
 		Subnet:               fmt.Sprintf("%s-worker-subnet", clusterID),
 		ManagedIdentity:      fmt.Sprintf("%s-identity", clusterID),
@@ -121,7 +117,7 @@ func (p *Provider) GenerateMachineSet(withWindowsLabel bool, replicas int32) (*m
 	}
 
 	// create new machine provider spec for deploying Windows node in the same Location and Zone as master-0
-	providerSpec, err := newAzureMachineProviderSpec(clusterID, status, masterProviderSpec.Location, *masterProviderSpec.Zone, p.vmSize, p.sshKeyPair)
+	providerSpec, err := newAzureMachineProviderSpec(clusterID, status, masterProviderSpec.Location, *masterProviderSpec.Zone, p.vmSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create new azure machine provider spec: %v", err)
 	}

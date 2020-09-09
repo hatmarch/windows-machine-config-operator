@@ -41,8 +41,6 @@ type globalContext struct {
 	nodes []core.Node
 	// skipNodeDeletion allows the Windows nodes to hang around after the test suite has been run.
 	skipNodeDeletion bool
-	// sshKeyPair is the name of the keypair that we can use to decrypt the Windows node created in AWS cloud
-	sshKeyPair string
 }
 
 // testContext holds the information related to the individual test suite. This data structure
@@ -90,9 +88,16 @@ func NewTestContext(t *testing.T) (*testContext, error) {
 		return nil, errors.Wrap(err, "cloud provider creation failed")
 	}
 	// number of nodes, retry interval and timeout should come from user-input flags
-	return &testContext{osdkTestCtx: fmwkTestContext, kubeclient: framework.Global.KubeClient,
-		timeout: retry.Timeout, retryInterval: retry.Interval, namespace: namespace, CloudProvider: cloudProvider,
-		hasCustomVXLAN: hasCustomVXLANPort, workloadNamespace: "wmco-test"}, nil
+	return &testContext{
+		osdkTestCtx:       fmwkTestContext,
+		kubeclient:        framework.Global.KubeClient,
+		timeout:           retry.Timeout,
+		retryInterval:     retry.Interval,
+		namespace:         namespace,
+		CloudProvider:     cloudProvider,
+		hasCustomVXLAN:    hasCustomVXLANPort,
+		workloadNamespace: "wmco-test",
+	}, nil
 }
 
 // cleanup cleans up the test context
