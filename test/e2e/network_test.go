@@ -31,7 +31,7 @@ func testNetwork(t *testing.T) {
 
 var (
 	// ubi8Image is the name/location of the linux image we will use for testing
-	ubi8Image = "registry.access.redhat.com/ubi8/ubi:latest"
+	ubi8Image = "registry.access.redhat.com/ubi8/ubi-minimal:latest"
 	// retryCount is the amount of times we will retry an api operation
 	retryCount = 20
 	// retryInterval is the interval of time until we retry after a failure
@@ -63,8 +63,8 @@ func testEastWestNetworking(t *testing.T) {
 		require.NoError(t, err, "could not retrieve pod with selector %v", *winServerDeployment.Spec.Selector)
 
 		// test Windows <-> Linux
-		// This will install curl and then curl the windows server.
-		linuxCurlerCommand := []string{"bash", "-c", "yum update; yum install curl -y; curl " + winServerIP}
+		// This will curl the windows server. curl must be present in the container image.
+		linuxCurlerCommand := []string{"bash", "-c", "curl " + winServerIP}
 		linuxCurlerJob, err := testCtx.createLinuxJob("linux-curler-"+strings.ToLower(node.Status.NodeInfo.MachineID), linuxCurlerCommand)
 		require.NoError(t, err, "could not create Linux job")
 		err = testCtx.waitUntilJobSucceeds(linuxCurlerJob.Name)
