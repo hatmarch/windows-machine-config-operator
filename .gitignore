@@ -91,3 +91,7 @@ tags
 
 # GoLand
 .idea/
+
+docker-secrets/
+base-image-assets/
+containers/
