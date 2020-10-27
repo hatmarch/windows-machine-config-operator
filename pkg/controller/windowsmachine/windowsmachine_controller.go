@@ -2,18 +2,18 @@ package windowsmachine
 
 import (
 	"context"
-	"io/ioutil"
+	"fmt"
 	"strings"
+	"time"
 
 	mapi "github.com/openshift/machine-api-operator/pkg/apis/machine/v1beta1"
-	wkl "github.com/openshift/windows-machine-config-operator/pkg/controller/wellknownlocations"
-	"github.com/openshift/windows-machine-config-operator/pkg/controller/windowsmachine/nodeconfig"
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/ssh"
 	core "k8s.io/api/core/v1"
 	k8sapierrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	kubeTypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
@@ -27,19 +27,31 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	"github.com/openshift/windows-machine-config-operator/pkg/clusternetwork"
+	"github.com/openshift/windows-machine-config-operator/pkg/controller/secrets"
+	"github.com/openshift/windows-machine-config-operator/pkg/controller/signer"
+	"github.com/openshift/windows-machine-config-operator/pkg/controller/windowsmachine/nodeconfig"
+	"github.com/openshift/windows-machine-config-operator/version"
 )
 
 const (
 	// ControllerName is the name of the WindowsMachine controller
 	ControllerName = "windowsmachine-controller"
+	// minHealthyCount is the minimum number of nodes that are required to be in running phase at a given time.
+	minHealthyCount = 1
+	// windowsOSLabel is the label used to identify the Windows Machines.
+	windowsOSLabel = "machine.openshift.io/os-id"
+	// requeueDuration is the time after which the request is requeued.
+	requeueDuration = time.Minute * 5
 )
 
 var log = logf.Log.WithName(ControllerName)
 
 // Add creates a new WindowsMachine Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and start it when the Manager is Started.
-func Add(mgr manager.Manager, clusterServiceCIDR string) error {
-	reconciler, err := newReconciler(mgr, clusterServiceCIDR)
+func Add(mgr manager.Manager, networkConfig clusternetwork.ClusterNetworkConfig, watchNamespace string) error {
+	reconciler, err := newReconciler(mgr, networkConfig, watchNamespace)
 	if err != nil {
 		return errors.Wrapf(err, "could not create %s reconciler", ControllerName)
 	}
@@ -47,7 +59,7 @@ func Add(mgr manager.Manager, clusterServiceCIDR string) error {
 }
 
 // newReconciler returns a new reconcile.Reconciler
-func newReconciler(mgr manager.Manager, clusterServiceCIDR string) (reconcile.Reconciler, error) {
+func newReconciler(mgr manager.Manager, networkConfig clusternetwork.ClusterNetworkConfig, watchNamespace string) (reconcile.Reconciler, error) {
 	// The default client serves read requests from the cache which
 	// could be stale and result in a get call to return an older version
 	// of the object. Hence we are using a non-default-client referenced
@@ -67,17 +79,18 @@ func newReconciler(mgr manager.Manager, clusterServiceCIDR string) (reconcile.Re
 		return nil, errors.Wrap(err, "error creating kubernetes clientset")
 	}
 
-	signer, err := createSigner()
+	serviceCIDR, err := networkConfig.GetServiceCIDR()
 	if err != nil {
-		return nil, errors.Wrapf(err, "error creating signer using private key: %v", wkl.PrivateKeyPath)
+		return nil, errors.Wrap(err, "error getting service CIDR")
 	}
 
 	return &ReconcileWindowsMachine{client: client,
 			scheme:             mgr.GetScheme(),
 			k8sclientset:       clientset,
-			clusterServiceCIDR: clusterServiceCIDR,
-			signer:             signer,
+			clusterServiceCIDR: serviceCIDR,
+			vxlanPort:          networkConfig.VXLANPort(),
 			recorder:           mgr.GetEventRecorderFor(ControllerName),
+			watchNamespace:     watchNamespace,
 		},
 		nil
 }
@@ -90,20 +103,14 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		return errors.Wrapf(err, "could not create %s", ControllerName)
 	}
 	// Watch for the Machine objects with label defined by windowsOSLabel
-	windowsOSLabel := "machine.openshift.io/os-id"
-	predicateFilter := predicate.Funcs{
-		// ignore create event for all Machines as WMCO should for Machine getting provisioned
+	machinePredicate := predicate.Funcs{
+		// We need the create event to account for Machines that are in provisioned state but were created
+		// before WMCO started running
 		CreateFunc: func(e event.CreateEvent) bool {
-			return false
+			return isWindowsMachine(e.Meta.GetLabels())
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			labels := e.MetaNew.GetLabels()
-			if value, ok := labels[windowsOSLabel]; ok {
-				if value == "Windows" {
-					return true
-				}
-			}
-			return false
+			return isWindowsMachine(e.MetaNew.GetLabels())
 		},
 		// ignore delete event for all Machines as WMCO does not react to node getting deleted
 		DeleteFunc: func(e event.DeleteEvent) bool {
@@ -113,12 +120,92 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 
 	err = c.Watch(&source.Kind{Type: &mapi.Machine{
 		ObjectMeta: meta.ObjectMeta{Namespace: "openshift-machine-api"},
-	}}, &handler.EnqueueRequestForObject{}, predicateFilter)
+	}}, &handler.EnqueueRequestForObject{}, machinePredicate)
 	if err != nil {
 		return errors.Wrap(err, "could not create watch on Machine objects")
 	}
 
+	err = c.Watch(&source.Kind{Type: &core.Node{
+		ObjectMeta: meta.ObjectMeta{Namespace: ""},
+	}}, &handler.EnqueueRequestsFromMapFunc{ToRequests: newNodeToMachineMapper(mgr.GetClient())}, predicate.Funcs{
+		CreateFunc: func(createEvent event.CreateEvent) bool {
+			if createEvent.Meta.GetAnnotations()[nodeconfig.VersionAnnotation] != version.Get() {
+				return true
+			}
+			return false
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if e.MetaNew.GetAnnotations()[nodeconfig.VersionAnnotation] != version.Get() {
+				return true
+			}
+			return false
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return false
+		},
+	})
+	if err != nil {
+		return errors.Wrap(err, "could not create watch on node objects")
+	}
+
 	return nil
+}
+
+// nodeToMachineMapper fulfills the mapper interface and allows for the mapping from a node to the associated Machine
+type nodeToMachineMapper struct {
+	client client.Client
+}
+
+// newNodeToMachineMapper returns a pointer to a new nodeToMachineMapper
+func newNodeToMachineMapper(client client.Client) *nodeToMachineMapper {
+	return &nodeToMachineMapper{client: client}
+}
+
+// Map maps Windows nodes to machines
+func (m *nodeToMachineMapper) Map(object handler.MapObject) []reconcile.Request {
+	node := core.Node{}
+
+	// If for some reason this mapper is called on an object which is not a Node, return
+	if kind := object.Object.GetObjectKind().GroupVersionKind(); kind.Kind != node.Kind {
+		return nil
+	}
+	if object.Meta.GetLabels()[core.LabelOSStable] != "windows" {
+		return nil
+	}
+
+	// Map the Node to the associated Machine through the Node's UID
+	machines := &mapi.MachineList{}
+	err := m.client.List(context.TODO(), machines,
+		client.MatchingLabels(map[string]string{windowsOSLabel: "Windows"}))
+	if err != nil {
+		log.Error(err, "could not get a list of machines")
+	}
+	for _, machine := range machines.Items {
+		if machine.Status.NodeRef != nil && machine.Status.NodeRef.UID == object.Meta.GetUID() {
+			return []reconcile.Request{
+				{
+					NamespacedName: types.NamespacedName{
+						Namespace: machine.GetNamespace(),
+						Name:      machine.GetName(),
+					},
+				},
+			}
+		}
+	}
+
+	// Node doesn't match a machine, return
+	return nil
+}
+
+// isWindowsMachine checks if the machine is a Windows machine or not
+func isWindowsMachine(labels map[string]string) bool {
+	windowsOSLabel := "machine.openshift.io/os-id"
+	if value, ok := labels[windowsOSLabel]; ok {
+		if value == "Windows" {
+			return true
+		}
+	}
+	return false
 }
 
 // blank assignment to verify that ReconcileWindowsMachine implements reconcile.Reconciler
@@ -137,8 +224,12 @@ type ReconcileWindowsMachine struct {
 	clusterServiceCIDR string
 	// signer is a signer created from the user's private key
 	signer ssh.Signer
+	// vxlanPort is the custom VXLAN port
+	vxlanPort string
 	// recorder to generate events
 	recorder record.EventRecorder
+	// watchNamespace is the namespace the operator is watching as defined by the operator CSV
+	watchNamespace string
 }
 
 // Reconcile reads that state of the cluster for a Windows Machine object and makes changes based on the state read
@@ -147,10 +238,18 @@ type ReconcileWindowsMachine struct {
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileWindowsMachine) Reconcile(request reconcile.Request) (reconcile.Result, error) {
 	log.Info("reconciling", "namespace", request.Namespace, "name", request.Name)
-
-	if err := r.createUserDataSecret(); err != nil {
-		return reconcile.Result{}, errors.Wrapf(err, "error creating user data secret")
+	// Get the private key that will be used to configure the instance
+	// Doing this before fetching the machine allows us to warn the user better about the missing private key
+	privateKey, err := secrets.GetPrivateKey(kubeTypes.NamespacedName{Namespace: r.watchNamespace,
+		Name: secrets.PrivateKeySecret}, r.client)
+	if err != nil {
+		if k8sapierrors.IsNotFound(err) {
+			// Private key was removed, requeue
+			return reconcile.Result{}, errors.Wrapf(err, "%s does not exist, please create it", secrets.PrivateKeySecret)
+		}
+		return reconcile.Result{}, errors.Wrapf(err, "unable to get secret %s", request.NamespacedName)
 	}
+
 	// Fetch the Machine instance
 	machine := &mapi.Machine{}
 	if err := r.client.Get(context.TODO(), request.NamespacedName, machine); err != nil {
@@ -165,15 +264,70 @@ func (r *ReconcileWindowsMachine) Reconcile(request reconcile.Request) (reconcil
 	}
 	// provisionedPhase is the status of the machine when it is in the `Provisioned` state
 	provisionedPhase := "Provisioned"
-	if machine.Status.Phase == nil || *machine.Status.Phase != provisionedPhase {
-		// Phase can be nil and should be ignored by WMCO
-		// If the Machine is not in provisioned state, WMCO shouldn't care about it
+	// runningPhase is the status of the machine when it is in the `Running` state, indicating that it is configured into a node
+	runningPhase := "Running"
+	if machine.Status.Phase == nil {
+		// Phase is nil and should be ignored by WMCO until phase is set
+		// TODO: Instead of requeuing ignore certain events: https://issues.redhat.com/browse/WINC-500
+		return reconcile.Result{}, fmt.Errorf("could not get the phase associated with machine %s", machine.Name)
+	} else if *machine.Status.Phase == runningPhase {
+		// Machine has been configured into a node, we need to ensure that the version annotation exists. If it doesn't
+		// the machine was not fully configured and needs to be configured properly.
+		if machine.Status.NodeRef == nil {
+			// NodeRef missing. Requeue and hope it is created. It never being created indicates an issue with the
+			// machine api operator
+			return reconcile.Result{}, fmt.Errorf("ready Windows machine %s missing NodeRef", machine.GetName())
+		}
+
+		node := &core.Node{}
+		err := r.client.Get(context.TODO(), kubeTypes.NamespacedName{Namespace: machine.Status.NodeRef.Namespace,
+			Name: machine.Status.NodeRef.Name}, node)
+		if err != nil {
+			return reconcile.Result{}, errors.Wrapf(err, "could not get node associated with machine %s", machine.GetName())
+		}
+
+		if _, present := node.Annotations[nodeconfig.VersionAnnotation]; present {
+			// version annotation doesn`t match the current operator version
+			if node.Annotations[nodeconfig.VersionAnnotation] != version.Get() {
+
+				if !r.isAllowedDeletion(machine) {
+					r.recorder.Eventf(machine, core.EventTypeWarning, "MachineDeletionRestricted", "Machine %v deletion restricted due to exceeded number of unhealthy machines. ", machine.Name)
+					return reconcile.Result{RequeueAfter: requeueDuration}, nil
+				}
+				if !machine.GetDeletionTimestamp().IsZero() {
+					// Delete already initiated
+					return reconcile.Result{}, nil
+				}
+
+				if err := r.client.Delete(context.TODO(), machine); err != nil {
+					r.recorder.Eventf(machine, core.EventTypeWarning, "MachineDeletionFailed", "Machine %v deletion failed: unable to delete Machine object: %v", machine.Name, err)
+					return reconcile.Result{}, err
+				}
+				r.recorder.Eventf(machine, core.EventTypeNormal, "MachineDeleted", "Machine %v has been remediated by requesting to delete Machine object", machine.Name)
+				return reconcile.Result{}, nil
+			}
+			// version annotation exists with a valid value, node is fully configured, do nothing.
+			return reconcile.Result{}, nil
+		}
+	} else if *machine.Status.Phase != provisionedPhase {
+		// Machine is not in provisioned or running state, nothing we should do as of now
 		return reconcile.Result{}, nil
 	}
 
-	// Get the IP address associated with the Windows machine.
+	// Update the signer with the existing privateKey
+	r.signer, err = signer.Create(privateKey)
+	if err != nil {
+		return reconcile.Result{}, errors.Wrap(err, "error creating signer")
+	}
+	// validate userData secret
+	if err := r.validateUserData(privateKey); err != nil {
+		return reconcile.Result{}, errors.Wrapf(err, "error validating userData secret")
+	}
+
+	// Get the IP address associated with the Windows machine, if not error out to requeue again
 	if len(machine.Status.Addresses) == 0 {
-		return reconcile.Result{}, nil
+		return reconcile.Result{}, errors.Errorf("machine %s doesn't have any ip addresses defined",
+			machine.Name)
 	}
 	ipAddress := ""
 	for _, address := range machine.Status.Addresses {
@@ -182,7 +336,8 @@ func (r *ReconcileWindowsMachine) Reconcile(request reconcile.Request) (reconcil
 		}
 	}
 	if len(ipAddress) == 0 {
-		return reconcile.Result{}, nil
+		return reconcile.Result{}, errors.Errorf("no internal ip address associated with machine %s",
+			machine.Name)
 	}
 
 	// Get the instance ID associated with the Windows machine.
@@ -190,15 +345,17 @@ func (r *ReconcileWindowsMachine) Reconcile(request reconcile.Request) (reconcil
 	if len(providerID) == 0 {
 		return reconcile.Result{}, nil
 	}
-	// Ex: aws:///us-east-1e/i-078285fdadccb2eaa. We always want the last entry which is the instanceID
+	// Ex: aws:///us-east-1e/i-078285fdadccb2eaa
+	// We always want the last entry which is the instanceID, and the first which is the provider name.
 	providerTokens := strings.Split(providerID, "/")
 	instanceID := providerTokens[len(providerTokens)-1]
 	if len(instanceID) == 0 {
 		return reconcile.Result{}, nil
 	}
+	providerName := strings.TrimSuffix(providerTokens[0], ":")
 
 	// Make the Machine a Windows Worker node
-	if err := r.addWorkerNode(ipAddress, instanceID); err != nil {
+	if err := r.addWorkerNode(ipAddress, providerName, instanceID); err != nil {
 		r.recorder.Eventf(machine, core.EventTypeWarning, "WMCO SetupFailure",
 			"Machine %s failed to be configured", machine.Name)
 		return reconcile.Result{}, err
@@ -210,9 +367,10 @@ func (r *ReconcileWindowsMachine) Reconcile(request reconcile.Request) (reconcil
 }
 
 // addWorkerNode configures the given Windows VM, adding it as a node object to the cluster
-func (r *ReconcileWindowsMachine) addWorkerNode(ipAddress, instanceID string) error {
+func (r *ReconcileWindowsMachine) addWorkerNode(ipAddress, providerName, instanceID string) error {
 	log.V(1).Info("configuring the Windows VM", "ID", instanceID)
-	nc, err := nodeconfig.NewNodeConfig(r.k8sclientset, ipAddress, instanceID, r.clusterServiceCIDR, r.signer)
+	nc, err := nodeconfig.NewNodeConfig(r.k8sclientset, ipAddress, providerName, instanceID, r.clusterServiceCIDR, r.vxlanPort,
+		r.signer)
 	if err != nil {
 		return errors.Wrapf(err, "failed to configure Windows VM %s", instanceID)
 	}
@@ -225,79 +383,63 @@ func (r *ReconcileWindowsMachine) addWorkerNode(ipAddress, instanceID string) er
 	return nil
 }
 
-// createUserDataSecret creates a secret 'windows-user-data' in 'openshift-machine-api'
-// namespace. This secret will be used to inject cloud provider user data for creating
-// windows machines
-func (r *ReconcileWindowsMachine) createUserDataSecret() error {
-	if r.signer == nil {
-		return errors.Errorf("failed to retrieve signer for private key: %v", wkl.PrivateKeyPath)
-	}
+// validateUserData validates userData secret. It returns error if the secret doesn`t
+// contain expected public key bytes.
+func (r *ReconcileWindowsMachine) validateUserData(privateKey []byte) error {
+	userDataSecret := &core.Secret{}
+	err := r.client.Get(context.TODO(), kubeTypes.NamespacedName{Name: "windows-user-data", Namespace: "openshift-machine-api"}, userDataSecret)
 
-	pubKeyBytes := ssh.MarshalAuthorizedKey(r.signer.PublicKey())
-	if pubKeyBytes == nil {
-		return errors.Errorf("failed to retrieve public key using signer for private key: %v", wkl.PrivateKeyPath)
-	}
-
-	// sshd service is started to create the default sshd_config file. This file is modified
-	// for enabling publicKey auth and the service is restarted for the changes to take effect.
-	userDataSecret := &core.Secret{
-		ObjectMeta: meta.ObjectMeta{
-			Name:      "windows-user-data",
-			Namespace: "openshift-machine-api",
-		},
-		Data: map[string][]byte{
-			"userData": []byte(`<powershell>
-			Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
-			$firewallRuleName = "ContainerLogsPort"
-			$containerLogsPort = "10250"
-			New-NetFirewallRule -DisplayName $firewallRuleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $containerLogsPort -EdgeTraversalPolicy Allow
-			Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
-			Install-Module -Force OpenSSHUtils
-			Set-Service -Name ssh-agent -StartupType ‘Automatic’
-			Set-Service -Name sshd -StartupType ‘Automatic’
-			Start-Service ssh-agent
-			Start-Service sshd
-			$pubKeyConf = (Get-Content -path C:\ProgramData\ssh\sshd_config) -replace '#PubkeyAuthentication yes','PubkeyAuthentication yes'
-			$pubKeyConf | Set-Content -Path C:\ProgramData\ssh\sshd_config
- 			$passwordConf = (Get-Content -path C:\ProgramData\ssh\sshd_config) -replace '#PasswordAuthentication yes','PasswordAuthentication yes'
-			$passwordConf | Set-Content -Path C:\ProgramData\ssh\sshd_config
-			$authFileConf = (Get-Content -path C:\ProgramData\ssh\sshd_config) -replace 'AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys','#AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys'
-			$authFileConf | Set-Content -Path C:\ProgramData\ssh\sshd_config
-			$pubKeyLocationConf = (Get-Content -path C:\ProgramData\ssh\sshd_config) -replace 'Match Group administrators','#Match Group administrators'
-			$pubKeyLocationConf | Set-Content -Path C:\ProgramData\ssh\sshd_config
-			Restart-Service sshd
-			New-item -Path $env:USERPROFILE -Name .ssh -ItemType Directory -force
-			echo "` + string(pubKeyBytes[:]) + `"| Out-File $env:USERPROFILE\.ssh\authorized_keys -Encoding ascii
-			</powershell>
-			<persist>true</persist>`),
-		},
-	}
-
-	// check if the userDataSecret already exists
-	err := r.client.Get(context.TODO(), kubeTypes.NamespacedName{Name: userDataSecret.Name, Namespace: userDataSecret.Namespace}, &core.Secret{})
 	if err != nil {
-		if k8sapierrors.IsNotFound(err) {
-			log.Info("Creating a new Secret", "Secret.Namespace", userDataSecret.Namespace, "Secret.Name", userDataSecret.Name)
-			err = r.client.Create(context.TODO(), userDataSecret)
-			if err != nil {
-				return errors.Wrap(err, "error creating windows user data secret")
-			}
-		}
-		return errors.Wrap(err, "error creating windows user data secret")
+		return errors.Errorf("could not find Windows userData secret in required namespace: %v", err)
+	}
+
+	secretData := string(userDataSecret.Data["userData"][:])
+	desiredUserDataSecret, err := secrets.GenerateUserData(privateKey)
+	if err != nil {
+		return err
+	}
+	if string(desiredUserDataSecret.Data["userData"][:]) != secretData {
+		return errors.Errorf("invalid content for userData secret")
 	}
 	return nil
 }
 
-// createSigner creates a signer using the private key from the privateKeyPath
-func createSigner() (ssh.Signer, error) {
-	privateKeyBytes, err := ioutil.ReadFile(wkl.PrivateKeyPath)
+// isAllowedDeletion determines if the number of machines after deletion of the given machine doesn`t fall below the
+// minHealthyCount
+func (r *ReconcileWindowsMachine) isAllowedDeletion(machine *mapi.Machine) bool {
+	if len(machine.OwnerReferences) == 0 {
+		return false
+	}
+	machinesetName := machine.OwnerReferences[0].Name
+
+	machines := &mapi.MachineList{}
+	err := r.client.List(context.TODO(), machines,
+		client.MatchingLabels(map[string]string{windowsOSLabel: "Windows"}))
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to find private key from path: %v", wkl.PrivateKeyPath)
+		return false
 	}
 
-	signer, err := ssh.ParsePrivateKey(privateKeyBytes)
+	// get Windows MachineSet
+	windowsMachineSet := &mapi.MachineSet{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: machinesetName,
+		Namespace: "openshift-machine-api"}, windowsMachineSet)
 	if err != nil {
-		return nil, errors.Wrapf(err, "unable to parse private key: %v", wkl.PrivateKeyPath)
+		return false
 	}
-	return signer, nil
+
+	if minHealthyCount == *(windowsMachineSet.Spec.Replicas) {
+		return true
+	}
+
+	totalHealthy := 0
+	for _, ma := range machines.Items {
+		// Machines are determined as Healthy when they are part of Windows MachineSet and are
+		// in the Running Status
+		if len(ma.OwnerReferences) != 0 && ma.OwnerReferences[0].Name == machinesetName {
+			if ma.Status.Phase != nil && *ma.Status.Phase == "Running" && ma.Status.NodeRef != nil {
+				totalHealthy += 1
+			}
+		}
+	}
+	return totalHealthy-1 >= minHealthyCount
 }
