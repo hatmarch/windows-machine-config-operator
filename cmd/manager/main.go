@@ -129,7 +129,6 @@ func main() {
 		wkl.KubeProxyPath,
 		wkl.IgnoreWgetPowerShellPath,
 		wkl.WmcbPath,
-		wkl.PrivateKeyPath,
 		wkl.CNIConfigTemplatePath,
 		wkl.HNSPSModule,
 	}
@@ -138,6 +137,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The watched namespace defined by the WMCO CSV
 	namespace, err := k8sutil.GetWatchNamespace()
 	if err != nil {
 		log.Error(err, "failed to get watch namespace")
@@ -152,8 +152,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// watch `openshift-machine-api` namespace along with wmco namespace
-	namespaces := []string{"openshift-machine-api", namespace}
+	// Allow for the watching of cluster-wide resources with "", so that we can watch nodes,
+	// as well as resources within the `openshift-machine-api` and WMCO namespace
+	namespaces := []string{"", "openshift-machine-api", namespace}
 	// Create a new Cmd to provide shared dependencies and start components
 	mgr, err := manager.New(cfg, manager.Options{
 		NewCache:           cache.MultiNamespacedCacheBuilder(namespaces),
@@ -172,15 +173,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Get the cluster serviceCIDR using clusterNetworkConfig interface
-	clusterServiceCIDR, err := clusterconfig.network.GetServiceCIDR()
-	if err != nil {
-		log.Error(err, "failed to get service CIDR from the cluster configuration")
-		os.Exit(1)
-	}
-
 	// Setup all Controllers
-	if err := controller.AddToManager(mgr, clusterServiceCIDR); err != nil {
+	if err := controller.AddToManager(mgr, clusterconfig.network, namespace); err != nil {
 		log.Error(err, "failed to add all Controllers to the Manager")
 		os.Exit(1)
 	}

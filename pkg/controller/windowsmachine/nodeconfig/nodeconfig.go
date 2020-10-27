@@ -10,6 +10,7 @@ import (
 	"github.com/openshift/windows-machine-config-operator/pkg/controller/retry"
 	wkl "github.com/openshift/windows-machine-config-operator/pkg/controller/wellknownlocations"
 	"github.com/openshift/windows-machine-config-operator/pkg/controller/windowsmachine/windows"
+	"github.com/openshift/windows-machine-config-operator/version"
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/ssh"
 	"k8s.io/api/core/v1"
@@ -20,8 +21,6 @@ import (
 )
 
 const (
-	// bootstrapCSR is the CSR name associated with a worker node that just got bootstrapped.
-	bootstrapCSR = "system:serviceaccount:openshift-machine-config-operator:node-bootstrapper"
 	// HybridOverlaySubnet is an annotation applied by the cluster network operator which is used by the hybrid overlay
 	HybridOverlaySubnet = "k8s.ovn.org/hybrid-overlay-node-subnet"
 	// HybridOverlayMac is an annotation applied by the hybrid-overlay
@@ -30,6 +29,8 @@ const (
 	WindowsOSLabel = "node.openshift.io/os_id=Windows"
 	// WorkerLabel is the label that needs to be applied to the Windows node to make it worker node
 	WorkerLabel = "node-role.kubernetes.io/worker"
+	// VersionAnnotation indicates the version of WMCO that configured the node
+	VersionAnnotation = "windowsmachineconfig.openshift.io/version"
 )
 
 // nodeConfig holds the information to make the given VM a kubernetes node. As of now, it holds the information
@@ -71,7 +72,7 @@ func discoverKubeAPIServerEndpoint() (string, error) {
 }
 
 // NewNodeConfig creates a new instance of nodeConfig to be used by the caller.
-func NewNodeConfig(clientset *kubernetes.Clientset, ipAddress, instanceID, clusterServiceCIDR string,
+func NewNodeConfig(clientset *kubernetes.Clientset, ipAddress, providerName, instanceID, clusterServiceCIDR, vxlanPort string,
 	signer ssh.Signer) (*nodeConfig, error) {
 	var err error
 	if nodeConfigCache.workerIgnitionEndPoint == "" {
@@ -93,7 +94,7 @@ func NewNodeConfig(clientset *kubernetes.Clientset, ipAddress, instanceID, clust
 			"creating new node config")
 	}
 
-	win, err := windows.New(ipAddress, instanceID, nodeConfigCache.workerIgnitionEndPoint, signer)
+	win, err := windows.New(ipAddress, providerName, instanceID, nodeConfigCache.workerIgnitionEndPoint, vxlanPort, signer)
 	if err != nil {
 		return nil, errors.Wrap(err, "error instantiating Windows instance from VM")
 	}
@@ -131,14 +132,24 @@ func (nc *nodeConfig) Configure() error {
 	if err := nc.setNode(); err != nil {
 		return errors.Wrapf(err, "error getting node object for VM %s", nc.ID())
 	}
-	// Apply worker labels
-	if err := nc.applyWorkerLabel(); err != nil {
-		return errors.Wrap(err, "failed applying worker label")
-	}
 	// Now that basic kubelet configuration is complete, configure networking in the node
 	if err := nc.configureNetwork(); err != nil {
 		return errors.Wrap(err, "configuring node network failed")
 	}
+
+	// Now that the node has been fully configured, add the version annotation to signify that the node
+	// was successfully configured by this version of WMCO
+	// populate node object in nodeConfig once more
+	if err := nc.setNode(); err != nil {
+		return errors.Wrapf(err, "error getting node object for VM %s", nc.ID())
+	}
+	nc.addVersionAnnotation()
+	node, err := nc.k8sclientset.CoreV1().Nodes().Update(context.TODO(), nc.node, metav1.UpdateOptions{})
+	if err != nil {
+		return errors.Wrap(err, "error updating node labels and annotations")
+	}
+	nc.node = node
+
 	return nil
 }
 
@@ -178,19 +189,9 @@ func (nc *nodeConfig) configureNetwork() error {
 	return nil
 }
 
-// applyWorkerLabel applies the worker label to the Windows Node we created.
-func (nc *nodeConfig) applyWorkerLabel() error {
-	if _, found := nc.node.Labels[WorkerLabel]; found {
-		log.V(1).Info("worker label %s already present on node %s", WorkerLabel, nc.node.GetName())
-		return nil
-	}
-	nc.node.Labels[WorkerLabel] = ""
-	node, err := nc.k8sclientset.CoreV1().Nodes().Update(context.TODO(), nc.node, metav1.UpdateOptions{})
-	if err != nil {
-		return errors.Wrap(err, "error applying worker label to node object")
-	}
-	nc.node = node
-	return nil
+// addVersionAnnotation adds the version annotation to nc.node
+func (nc *nodeConfig) addVersionAnnotation() {
+	nc.node.Annotations[VersionAnnotation] = version.Get()
 }
 
 // setNode identifies the node from the instanceID provided and sets the node object in the nodeconfig.
@@ -199,10 +200,12 @@ func (nc *nodeConfig) setNode() error {
 		nodes, err := nc.k8sclientset.CoreV1().Nodes().List(context.TODO(),
 			metav1.ListOptions{LabelSelector: WindowsOSLabel})
 		if err != nil {
-			return false, errors.Wrap(err, "could not get list of nodes")
+			log.V(1).Info("node object listing failed for", "Machine ID", nc.ID(), "error", err)
+			return false, nil
 		}
 		if len(nodes.Items) == 0 {
-			return false, errors.Errorf("no nodes found")
+			log.V(1).Info("got empty node list for", "Machine ID", nc.ID(), "error", err)
+			return false, nil
 		}
 		// get the node with given instance id
 		for _, node := range nodes.Items {
@@ -224,7 +227,8 @@ func (nc *nodeConfig) waitForNodeAnnotation(annotation string) error {
 	err := wait.Poll(retry.Interval, retry.Timeout, func() (bool, error) {
 		node, err := nc.k8sclientset.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
 		if err != nil {
-			return false, errors.Wrapf(err, "error getting node %s", nodeName)
+			log.V(1).Info("error getting node object associated with", "Machine ID", nc.ID(), "error", err)
+			return false, nil
 		}
 		_, found := node.Annotations[annotation]
 		if found {
