@@ -5,10 +5,10 @@ metadata:
     alm-examples: '[]'
     capabilities: Basic Install
     operatorframework.io/cluster-monitoring: "true"
-    operatorframework.io/suggested-namespace: windows-machine-config-operator
+    operatorframework.io/suggested-namespace: openshift-windows-machine-config-operator
     repository: https://github.com/openshift/windows-machine-config-operator
   name: windows-machine-config-operator.v0.0.0
-  namespace: windows-machine-config-operator
+  namespace: openshift-windows-machine-config-operator
 spec:
   apiservicedefinitions: {}
   customresourcedefinitions: {}
@@ -70,6 +70,9 @@ spec:
           verbs:
           - create
           - get
+          - list
+          - watch
+          - update
         - apiGroups:
           - machine.openshift.io
           resources:
@@ -77,6 +80,15 @@ spec:
           verbs:
           - get
           - list
+          - watch
+          - delete
+        - apiGroups:
+          - machine.openshift.io
+          resources:
+          - machinesets
+          verbs:
+          - list
+          - get
           - watch
         serviceAccountName: windows-machine-config-operator
       deployments:
@@ -113,16 +125,8 @@ spec:
                 imagePullPolicy: Always
                 name: windows-machine-config-operator
                 resources: {}
-                volumeMounts:
-                - mountPath: /etc/private-key/
-                  name: cloud-private-key
-                  readOnly: true
               hostNetwork: true
               serviceAccountName: windows-machine-config-operator
-              volumes:
-              - name: cloud-private-key
-                secret:
-                  secretName: cloud-private-key
       permissions:
       - rules:
         - apiGroups:
@@ -197,6 +201,7 @@ spec:
   maintainers:
   - {}
   maturity: alpha
+  minKubeVersion: 1.19.0
   provider:
     name: Red Hat
   version: 0.0.0

@@ -8,12 +8,12 @@ source $WMCO_ROOT/hack/common.sh
 
 NODE_COUNT=""
 SKIP_NODE_DELETION=""
-KEY_PAIR_NAME=""
+WMCO_PATH_OPTION=""
 
 export CGO_ENABLED=0
 
 get_WMCO_logs() {
-  oc logs -l name=windows-machine-config-operator -n windows-machine-config-operator --tail=-1
+  oc logs -l name=windows-machine-config-operator -n openshift-windows-machine-config-operator --tail=-1
 }
 
 # This function runs operator-sdk test with certain go test arguments
@@ -29,40 +29,45 @@ OSDK_WMCO_test() {
   local OSDK_PATH=$1
   local TEST_FLAGS=$2
 
-  if ! $OSDK_PATH test local ./test/e2e --no-setup --debug --operator-namespace=windows-machine-config-operator --go-test-flags "$TEST_FLAGS"; then
+  if ! $OSDK_PATH test local ./test/e2e --no-setup --debug --operator-namespace=openshift-windows-machine-config-operator --go-test-flags "$TEST_FLAGS"; then
     get_WMCO_logs
     return 1
   fi
 }
 
-while getopts ":n:k:s" opt; do
+while getopts ":n:k:b:s" opt; do
   case ${opt} in
     n ) # process option for the node count
       NODE_COUNT=$OPTARG
       ;;
-    k ) # process option for the keypair to be used by AWS cloud provider
-      KEY_PAIR_NAME=$OPTARG
-      ;;
     s ) # process option for skipping deleting Windows VMs created by test suite
-      SKIP_NODE_DELETION="-skip-node-deletion"
+      SKIP_NODE_DELETION="true"
+      ;;
+    b ) # path to the WMCO binary, used for version validation
+      WMCO_PATH_OPTION="-wmco-path=$OPTARG"
       ;;
     \? )
-      echo "Usage: $0 [-n] [-k] [-s]"
+      echo "Usage: $0 [-n] [-k] [-s] [-b]"
       exit 0
       ;;
   esac
 done
 
+# KUBE_SSH_KEY_PATH needs to be set in order to create the cloud-private-key secret
+if [ -z "$KUBE_SSH_KEY_PATH" ]; then
+    echo "env KUBE_SSH_KEY_PATH not found"
+    return 1
+fi
+
 OSDK=$(get_operator_sdk)
 
 # Set default values for the flags. Without this operator-sdk flags are getting
-# polluted. For example, if KEY_PAIR_NAME is not passed or passed as empty value
+# polluted, i.e. if a flag is not passed or passed as empty value
 # the value is literally taken as "" instead of empty-string so default values we
 # specified in main_test.go has literally no effect. Not sure, if this is because of
 # the way operator-sdk testing is done using `go test []string{}
 NODE_COUNT=${NODE_COUNT:-2}
-SKIP_NODE_DELETION=${SKIP_NODE_DELETION:-"-skip-node-deletion=false"}
-KEY_PAIR_NAME=${KEY_PAIR_NAME:-"openshift-dev"}
+SKIP_NODE_DELETION=${SKIP_NODE_DELETION:-"false"}
 
 # If ARTIFACT_DIR is not set, create a temp directory for artifacts
 ARTIFACT_DIR=${ARTIFACT_DIR:-}
@@ -91,17 +96,32 @@ fi
 
 # The bool flags in golang does not respect key value pattern. They follow -flag=x pattern.
 # -flag x is allowed for non-boolean flags only(https://golang.org/pkg/flag/)
-# Run the creation tests and skip deletion of the Windows VMs
-OSDK_WMCO_test $OSDK "-run=TestWMCO/create -v -timeout=90m -node-count=$NODE_COUNT -skip-node-deletion -ssh-key-pair=$KEY_PAIR_NAME"
+
+# Test that the operator is running when the private key secret is not present
+OSDK_WMCO_test $OSDK "-run=TestWMCO/operator_deployed_without_private_key_secret -v -node-count=$NODE_COUNT --private-key-path=$KUBE_SSH_KEY_PATH $WMCO_PATH_OPTION"
+
+# Run the creation tests of the Windows VMs
+OSDK_WMCO_test $OSDK "-run=TestWMCO/create -v -timeout=90m -node-count=$NODE_COUNT --private-key-path=$KUBE_SSH_KEY_PATH $WMCO_PATH_OPTION"
+# Get logs for the creation tests
+printf "\n####### WMCO logs for creation tests #######\n"
+get_WMCO_logs
+
+# Run the upgrade tests and skip deletion of the Windows VMs
+OSDK_WMCO_test $OSDK "-run=TestWMCO/upgrade -v -timeout=90m -node-count=$NODE_COUNT --private-key-path=$KUBE_SSH_KEY_PATH $WMCO_PATH_OPTION"
 
 # Run the deletion tests while testing operator restart functionality. This will clean up VMs created
 # in the previous step
-OSDK_WMCO_test $OSDK "-run=TestWMCO/destroy -v -timeout=60m -ssh-key-pair=$KEY_PAIR_NAME"
-
-# Get logs on success before cleanup
-get_WMCO_logs
-
-# Cleanup the operator resources
-cleanup_WMCO $OSDK
+if ! $SKIP_NODE_DELETION; then
+  OSDK_WMCO_test $OSDK "-run=TestWMCO/destroy -v -timeout=60m --private-key-path=$KUBE_SSH_KEY_PATH"
+  # Get logs on success before cleanup
+  printf "\n####### WMCO logs for upgrade and deletion tests #######\n"
+  get_WMCO_logs
+  # Cleanup the operator resources
+  cleanup_WMCO $OSDK
+else
+  # Get logs on success
+  printf "\n####### WMCO logs for upgrade tests #######\n"
+  get_WMCO_logs
+fi
 
 exit 0

@@ -3,7 +3,7 @@ kind: Role
 metadata:
   creationTimestamp: null
   name: windows-machine-config-operator
-  namespace: windows-machine-config-operator
+  namespace: openshift-windows-machine-config-operator
 rules:
 - apiGroups:
   - ""
@@ -125,6 +125,9 @@ rules:
    verbs:
      - create
      - get
+     - list
+     - watch
+     - update
 # Permissions to access the machine api
  - apiGroups:
      - "machine.openshift.io"
@@ -133,4 +136,13 @@ rules:
    verbs:
      - get
      - list
+     - watch
+     - delete
+ - apiGroups:
+     - machine.openshift.io
+   resources:
+     - machinesets
+   verbs:
+     - list
+     - get
      - watch

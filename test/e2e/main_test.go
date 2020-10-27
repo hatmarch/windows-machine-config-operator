@@ -5,22 +5,23 @@ import (
 	"testing"
 	"time"
 
-	"github.com/openshift/windows-machine-config-operator/pkg/controller/retry"
-	"github.com/openshift/windows-machine-config-operator/test/e2e/providers"
 	framework "github.com/operator-framework/operator-sdk/pkg/test"
 	"github.com/pkg/errors"
-	"k8s.io/api/core/v1"
+	core "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/openshift/windows-machine-config-operator/pkg/controller/retry"
+	"github.com/openshift/windows-machine-config-operator/test/e2e/clusterinfo"
+	"github.com/openshift/windows-machine-config-operator/test/e2e/providers"
 )
 
 var (
 	// numberOfNodes represent the number of nodes to be dealt with in the test suite.
 	numberOfNodes int
-	// skipNodeDeletion allows the Windows nodes to hang around after the test suite has been run. This skips the deletion
-	// test suite.
-	skipNodeDeletion bool
-	// sshKeyPair is the name of the keypair that we can use to decrypt the Windows node created in AWS cloud
-	sshKeyPair string
+	// privateKeyPath is the path of the private key file used to configure the Windows node
+	privateKeyPath string
+	// wmcoPath is the path to the WMCO binary that was used within the operator image
+	wmcoPath string
 	// gc is the global context across the test suites.
 	gc = globalContext{}
 )
@@ -34,11 +35,9 @@ type globalContext struct {
 	// numberOfNodes to be used for the test suite.
 	numberOfNodes int32
 	// nodes are the Windows nodes created by the operator
-	nodes []v1.Node
-	// skipNodeDeletion allows the Windows nodes to hang around after the test suite has been run.
-	skipNodeDeletion bool
-	// sshKeyPair is the name of the keypair that we can use to decrypt the Windows node created in AWS cloud
-	sshKeyPair string
+	nodes []core.Node
+	// privateKeyPath is the path of the private key file used to configure the Windows node
+	privateKeyPath string
 }
 
 // testContext holds the information related to the individual test suite. This data structure
@@ -60,6 +59,10 @@ type testContext struct {
 	timeout time.Duration
 	// CloudProvider to talk to various cloud providers
 	providers.CloudProvider
+	// hasCustomVXLAN tells if the cluster is using a custom VXLAN port for communication
+	hasCustomVXLAN bool
+	// workloadNamespace is the namespace to deploy our test pods on
+	workloadNamespace string
 }
 
 // NewTestContext returns a new test context to be used by every test.
@@ -69,13 +72,22 @@ func NewTestContext(t *testing.T) (*testContext, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "test context instantiation failed")
 	}
-	cloudProvider, err := providers.NewCloudProvider(sshKeyPair)
+	oc, err := clusterinfo.GetOpenShift()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to initialize OpenShift client")
+	}
+	hasCustomVXLANPort, err := oc.HasCustomVXLANPort()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to determine if cluster is using custom VXLAN port")
+	}
+	cloudProvider, err := providers.NewCloudProvider(hasCustomVXLANPort)
 	if err != nil {
 		return nil, errors.Wrap(err, "cloud provider creation failed")
 	}
 	// number of nodes, retry interval and timeout should come from user-input flags
 	return &testContext{osdkTestCtx: fmwkTestContext, kubeclient: framework.Global.KubeClient,
-		timeout: retry.Timeout, retryInterval: retry.Interval, namespace: namespace, CloudProvider: cloudProvider}, nil
+		timeout: retry.Timeout, retryInterval: retry.Interval, namespace: namespace, CloudProvider: cloudProvider,
+		hasCustomVXLAN: hasCustomVXLANPort, workloadNamespace: "wmco-test"}, nil
 }
 
 // cleanup cleans up the test context
@@ -85,10 +97,9 @@ func (tc *testContext) cleanup() {
 
 func TestMain(m *testing.M) {
 	flag.IntVar(&numberOfNodes, "node-count", 2, "number of nodes to be created for testing")
-	flag.BoolVar(&skipNodeDeletion, "skip-node-deletion", false,
-		"Option to disable deletion of the VMs")
-	// We're using openshift-dev as default value to be used in CI
-	flag.StringVar(&sshKeyPair, "ssh-key-pair", "openshift-dev", "SSH Key Pair to be used for decrypting "+
-		"the Windows Node password")
+	flag.StringVar(&wmcoPath, "wmco-path", "./build/_output/bin/windows-machine-config-operator",
+		"Path to the WMCO binary, used for version validation")
+	flag.StringVar(&privateKeyPath, "private-key-path", "",
+		"path of the private key file used to configure the Windows node")
 	framework.MainEntry(m)
 }

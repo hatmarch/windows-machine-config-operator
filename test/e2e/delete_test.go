@@ -9,8 +9,11 @@ import (
 	framework "github.com/operator-framework/operator-sdk/pkg/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/openshift/windows-machine-config-operator/pkg/controller/secrets"
 )
 
 func deletionTestSuite(t *testing.T) {
@@ -51,7 +54,7 @@ func testWindowsNodeDeletion(t *testing.T) {
 		t.Fatalf("error updating windowsMachineSet custom resource  %v", err)
 	}
 	// As per testing, each windows VM is taking roughly 12 minutes to be shown up in the cluster
-	err = testCtx.waitForWindowsNodes(gc.numberOfNodes, true, true)
+	err = testCtx.waitForWindowsNodes(gc.numberOfNodes, true, true, false)
 	if err != nil {
 		t.Fatalf("windows node deletion failed  with %v", err)
 	}
@@ -63,4 +66,12 @@ func testWindowsNodeDeletion(t *testing.T) {
 			Namespace: "openshift-machine-api"}, machineSet)
 		assert.NoError(t, framework.Global.Client.Delete(context.TODO(), machineSet))
 	}
+
+	// Cleanup secrets created by us.
+	err = framework.Global.KubeClient.CoreV1().Secrets("openshift-machine-api").Delete(context.TODO(), "windows-user-data", meta.DeleteOptions{})
+	require.NoError(t, err, "could not delete userData secret")
+
+	err = framework.Global.KubeClient.CoreV1().Secrets("openshift-windows-machine-config-operator").Delete(context.TODO(), secrets.PrivateKeySecret, meta.DeleteOptions{})
+	require.NoError(t, err, "could not delete privateKey secret")
+
 }

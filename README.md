@@ -12,10 +12,13 @@ Customers will eventually be able to install it using OperatorHub. These instruc
 the latest version of the operator.
 
 ## Pre-requisites
-- [Install](https://sdk.operatorframework.io/docs/install-operator-sdk/) operator-sdk
+- OpenShift 4.6+ cluster on Azure / AWS configured with
+  [hybrid OVN Kubernetes networking](https://github.com/openshift/windows-machine-config-bootstrapper/blob/release-4.6/tools/ansible/docs/ocp-4-4-with-windows-server.md#bring-up-the-openshift-cluster-with-ovn-kubernetes).
+- [Install](https://v0-18-x.sdk.operatorframework.io/docs/install-operator-sdk/) operator-sdk
   v0.18.1
+  - Note that the doc sets the release to `v0.18.2`. Please use `v0.18.1` instead.
 - The operator is written using operator-sdk [v0.18.1](https://github.com/operator-framework/operator-sdk/releases/tag/v0.18.1)
-  and has the same [pre-requisites](https://sdk.operatorframework.io/docs/install-operator-sdk/#prerequisites) as it
+  and has the same [pre-requisites](https://v0-18-x.sdk.operatorframework.io/docs/install-operator-sdk/#prerequisites) as it
   does.
 - Instructions assume that the user is using [Podman](https://podman.io/) container engine.
 
@@ -31,11 +34,15 @@ podman push quay.io/<insert username>/wmco:$VERSION_TAG
 ```
 ## Development workflow
 To run the operator on a cluster (for testing purpose only) or to run the e2e tests for WMCO against an OpenShift 
-cluster set up on AWS, we need to setup the following environment variables.
+cluster set up, we need to setup the following environment variables.
 ```shell script
 export KUBECONFIG=<path to kubeconfig>
-export AWS_SHARED_CREDENTIALS_FILE=<path to aws credentials file>
+
+# SSH key to be used for creation of cloud-private-key secret 
 export KUBE_SSH_KEY_PATH=<path to RSA type ssh key>
+
+# on AWS only:
+export AWS_SHARED_CREDENTIALS_FILE=<path to aws credentials file>
 ```
 
 To run the operator on a cluster, use: 
@@ -51,9 +58,6 @@ To clean-up the installation, use:
 hack/olm.sh cleanup
 ```
 
-*Operator-sdk has a known bug while using `operator-sdk run/cleanup packagemanifests` where it shows failure on success. 
-Track the issue [here](https://github.com/operator-framework/operator-sdk/issues/2938). The error does not imply that the operator will not work.*
-
 ### Running e2e tests on a cluster
 We need to set up all the environment variables required in [Development workflow](#development-workflow) as well as: 
 ```shell script
@@ -61,19 +65,20 @@ export OPERATOR_IMAGE=<registry url for remote WMCO image>
 ```
 Once the above variables are set, run the following script:
 ```shell script
-hack/run-ci-e2e-test.sh -k "openshift-dev"
+hack/run-ci-e2e-test.sh
 ```
-We assume that the developer uses `openshift-dev` as the key pair in the aws cloud
 
 Additional flags that can be passed to `hack/run-ci-e2e-test.sh` are
 - `-s` to skip the deletion of Windows nodes that are created as part of test suite run
 - `-n` to represent the number of Windows nodes to be created for test run
-- `-k` to represent the AWS specific key pair that will be used during e2e run and it should map to the private key
-       that we have in `KUBE_SSH_KEY_PATH`. The default value points to `openshift-dev` which we use in our CI
+- `-b` gives an alternative path to the WMCO binary. This option overridden in OpenShift CI.
+       When building the operator locally, the WMCO binary is created as part of the operator image build process and
+       can be found at `build/_output/bin/windows-machine-config-operator`, this is the default value of this option.
+
        
 Example command to spin up 2 Windows nodes and retain them after test run:
 ```
-hack/run-ci-e2e-test.sh -s -k "openshift-dev" -n 2      
+hack/run-ci-e2e-test.sh -s -n 2      
 ```
 
 ## Bundling the Windows Machine Config Operator
@@ -162,14 +167,14 @@ This deployment method is currently not supported. Please use the [CLI](#cli)
 
 #### CLI
 
-Create the windows-machine-config-operator namespace:
+Create the openshift-windows-machine-config-operator namespace:
 ```shell script
 oc apply -f deploy/namespace.yaml
 ```
 
-Switch to the windows-machine-config-operator project:
+Switch to the openshift-windows-machine-config-operator project:
 ```shell script
-oc project windows-machine-config-operator
+oc project openshift-windows-machine-config-operator
 ```
 
 ##### Create private key Secret
@@ -209,41 +214,50 @@ oc apply -f deploy/olm-catalog/subscription.yaml
 ```
 
 ### Creating a Windows MachineSet
-Below is the example of an AWS Windows MachineSet which can create Windows Machines that the WMCO can react upon. Please
+Below is the example of an Azure Windows MachineSet which can create Windows Machines that the WMCO can react upon. Please
 note that the `windows-user-data` secret will be created by the WMCO lazily when it is configuring the first Windows 
 Machine. After that, the `windows-user-data` will be available for the subsequent MachineSets to be consumed. It might 
 take around 10 minutes for the Windows VM to be configured so that it joins the cluster. Please note that the MachineSet
-should have `machine.openshift.io/os-id: Windows` label, and _\<windows_container_ami\>_ should be replaced with the
-AMI ID of a Windows image with a container run-time installed. _\<infrastructureID\>_ should be replaced with the output
-of:
+should have following labels:
+- `machine.openshift.io/os-id: Windows`
+- `machine.openshift.io/cluster-api-machine-role: worker` 
+- `machine.openshift.io/cluster-api-machine-type: worker` 
+
+The following label, needs to be added to the `Machine` spec with the `MachineSet` spec:
+- `node-role.kubernetes.io/worker: ""`
+
+Not having these labels will result in the Windows node not being marked as a worker.
+
+##### Example
+
+_\<infrastructureID\>_ should be replaced with the output of:
 ```shell script
  oc get -o jsonpath='{.status.infrastructureName}{"\n"}' infrastructure cluster
 ```
-_\<region\>_ should be replaced with a valid AWS region like `us-east-1`. _\<zone\>_ should be replaced with a valid AWS
-availability zone like `us-east-1a`.
+_\<location\>_ should be replaced with a valid Azure location like `centralus`.
+_\<zone\>_ should be replaced with a valid Azure availability zone, i.e. `1`, `2` or `3`.
 
-##### Example:
 ```
 apiVersion: machine.openshift.io/v1beta1
 kind: MachineSet
 metadata:
   labels:
     machine.openshift.io/cluster-api-cluster: <infrastructureID> 
-  name: <infrastructureID>-worker-<zone>
+  name: <infrastructureID>-windows-worker-<zone>
   namespace: openshift-machine-api
 spec:
   replicas: 1
   selector:
     matchLabels:
       machine.openshift.io/cluster-api-cluster: <infrastructureID> 
-      machine.openshift.io/cluster-api-machineset: <infrastructureID>-worker-<zone>
+      machine.openshift.io/cluster-api-machineset: <infrastructureID>-windows-worker-<zone>
   template:
     metadata:
       labels:
         machine.openshift.io/cluster-api-cluster: <infrastructureID> 
         machine.openshift.io/cluster-api-machine-role: worker
         machine.openshift.io/cluster-api-machine-type: worker
-        machine.openshift.io/cluster-api-machineset: <infrastructureID>-worker-<zone>
+        machine.openshift.io/cluster-api-machineset: <infrastructureID>-windows-worker-<zone>
         machine.openshift.io/os-id: Windows
     spec:
       metadata:
@@ -251,37 +265,50 @@ spec:
           node-role.kubernetes.io/worker: ""
       providerSpec:
         value:
-          ami:
-            id: <windows_container_ami>
-          apiVersion: awsproviderconfig.openshift.io/v1beta1
-          blockDevices:
-            - ebs:
-                iops: 0
-                volumeSize: 120
-                volumeType: gp2
+          apiVersion: azureproviderconfig.openshift.io/v1beta1
           credentialsSecret:
-            name: aws-cloud-credentials
-          deviceIndex: 0
-          iamInstanceProfile:
-            id: <infrastructureID>-worker-profile 
-          instanceType: m5a.large
-          kind: AWSMachineProviderConfig
-          placement:
-            availabilityZone: <zone>
-            region: <region>
-          securityGroups:
-            - filters:
-                - name: tag:Name
-                  values:
-                    - <infrastructureID>-worker-sg 
-          subnet:
-            filters:
-              - name: tag:Name
-                values:
-                  - <infrastructureID>-private-<zone>
-          tags:
-            - name: kubernetes.io/cluster/<infrastructureID> 
-              value: owned
+            name: azure-cloud-credentials
+            namespace: openshift-machine-api
+          image:
+            offer: WindowsServer
+            publisher: MicrosoftWindowsServer
+            resourceID: ""
+            sku: 2019-Datacenter-with-Containers
+            version: latest
+          kind: AzureMachineProviderSpec
+          location: <location>
+          managedIdentity: <infrastructureID>-identity
+          networkResourceGroup: <infrastructureID>-rg
+          osDisk:
+            diskSizeGB: 128
+            managedDisk:
+              storageAccountType: Premium_LRS
+            osType: Windows
+          publicIP: false
+          resourceGroup: <infrastructureID>-rg
+          subnet: <infrastructureID>-worker-subnet
           userDataSecret:
             name: windows-user-data
+            namespace: openshift-machine-api
+          vmSize: Standard_D2s_v3
+          vnet: <infrastructureID>-vnet
+          zone: "<zone>"
 ```
+
+Example MachineSet for other cloud providers:
+- [AWS](docs/machineset-aws.md).
+
+### Windows nodes Kubernetes component upgrade
+
+When a new version of WMCO is released that is compatible with the current cluster version, an operator upgrade will 
+take place which will result in the Kubernetes components in the Windows Machine to be upgraded. For a non-disruptive 
+upgrade, WMCO terminates the Windows Machines configured by previous version of WMCO and recreates them using the
+current version. This is done by deleting the Machine object that results in the drain and deletion of the Windows node.
+To facilitate an upgrade, WMCO adds a version annotation to all the configured nodes. During an upgrade, a mismatch in
+version annotation will result in deletion and recreation of Windows Machine. In order to have minimal service 
+disruption during an upgrade, WMCO makes sure that the cluster will have atleast 1 Windows Machine per MachineSet in the
+running state.
+
+WMCO is not responsible for Windows operating system updates. The cluster administrator provides the Window image while
+creating the VMs and hence, the cluster administrator is responsible for providing an updated image. The cluster 
+administrator can provide an updated image by changing the image in the MachineSet spec.
